@@ -173,7 +173,7 @@ export default class CityScene extends Phaser.Scene {
         this.add.image(position.x, position.y, textureKey)
           .setOrigin(0.5, 0)
           .setScale(textureKey.startsWith("city_snow_") ? 0.51 : 1.02)
-          .setDepth(this.depthFromSortPoint(position.x, position.y + TILE_HEIGHT / 2));
+          .setDepth(this.depthFromSortPoint(position.x, position.y));
       }
     }
 
