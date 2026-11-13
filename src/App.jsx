@@ -176,7 +176,7 @@ function IllustratedFooter({ openNotice, openGame }) {
         <nav className="footer-links" aria-label="Footer navigation">
           <a href="#home">Home</a>
           <button type="button" onClick={openGame}>Story Mode</button>
-          <button type="button" onClick={() => openNotice('study')}>Study Mode <span>IN DEV</span></button>
+          <button type="button" onClick={() => openGame("study")}>Study Mode <span>IN DEV</span></button>
           <button type="button" onClick={() => openNotice('teacher')}>Teacher Portal</button>
         </nav>
       </div>
@@ -193,15 +193,17 @@ export default function App() {
   const [notice, setNotice] = useState(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [gameOpen, setGameOpen] = useState(false);
+  const [gameMode, setGameMode] = useState("story");
 
   const openNotice = (type) => {
     setNotice(type);
     setMenuOpen(false);
   };
 
-  const openGame = () => {
+  const openGame = (mode = "story") => {
     setNotice(null);
     setMenuOpen(false);
+    setGameMode(mode);
     setGameOpen(true);
   };
 
@@ -231,7 +233,7 @@ export default function App() {
           ← Back to PhishVille
         </button>
         <div style={{ flex: 1, minHeight: 0 }}>
-          <Game />
+          <Game mode={gameMode} />
         </div>
       </div>
     );

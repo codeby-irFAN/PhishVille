@@ -1,5 +1,6 @@
 import Phaser from "phaser";
 import { BUILDINGS, getBuildingFootprint } from "../data/buildings";
+import { STUDY_LESSONS } from "../data/studyLessons";
 
 const TILE_WIDTH = 44;
 const TILE_HEIGHT = 22;
@@ -16,9 +17,13 @@ const PLAYER_SPEED = 100;
 // Fixed close-up camera. The old wheel zoom topped out at 1.2.
 const FIXED_CAMERA_ZOOM = 2.2;
 
-// Extra grass tiles extend the city past its original edge, then fade into the sky.
+// A natural outskirts ring gives the camera a little breathing room.
+// The perimeter fog hides its edge instead of fading individual checkerboard tiles.
 const EDGE_PADDING_TILES = 8;
-const EDGE_FADE_STRENGTH = 0.92;
+const PERIMETER_FOG_DEPTH = 210;
+const PERIMETER_FOG_ALPHA = 0.92;
+const OUTSKIRT_TINT = 0x829675;
+const GROUND_LIGHT_TINT = 0xfff5e4;
 
 const ORIENTATION_TO_SPRITE = {
   down: "south",
@@ -50,6 +55,8 @@ export default class CityScene extends Phaser.Scene {
     this.gridOffsetY = GRID_OFFSET_Y;
     this.skyBackdrop = null;
     this.skyClouds = [];
+    this.perimeterFog = [];
+    this.sunlightLayers = [];
     this.keys = null;
     this.isPanning = false;
     this.lastPointer = { x: 0, y: 0 };
@@ -58,6 +65,42 @@ export default class CityScene extends Phaser.Scene {
     this.playerFlipX = false;
     this.controlHint = null;
     this.isDraggingCamera = false;
+    this.isStudyMode = false;
+    this.studyLesson = null;
+    this.studyStepIndex = 0;
+    this.studyNpcs = [];
+    this.studyHudText = null;
+    this.studyProgressText = null;
+    this.studyDialoguePanel = null;
+    this.studyDialogueName = null;
+    this.studyDialogueText = null;
+    this.studyDialogueHint = null;
+    this.studyInteractPrompt = null;
+    this.studyWaypoint = null;
+    this.studyDialogueOpen = false;
+    this.studyPendingReturn = false;
+    this.studyInteractKey = null;
+  }
+
+  init(data = {}) {
+    this.isStudyMode = data.studyMode === true;
+    this.studyLessonId = data.lessonId || null;
+    this.studyStepIndex = Number.isInteger(data.stepIndex) ? data.stepIndex : 0;
+    this.studyNpcs = [];
+    this.studyWaypoint = null;
+    this.studyDialogueOpen = false;
+    this.studyPendingReturn = false;
+    this.studyHudText = null;
+    this.studyProgressText = null;
+    this.studyDialoguePanel = null;
+    this.studyDialogueName = null;
+    this.studyDialogueText = null;
+    this.studyDialogueHint = null;
+    this.studyInteractPrompt = null;
+    this.studyInteractKey = null;
+    this.player = null;
+    this.keys = null;
+    this.isPanning = false;
   }
 
   preload() {
@@ -71,21 +114,28 @@ export default class CityScene extends Phaser.Scene {
 
     // Character0 is a 5-direction isometric character sheet:
     // Walk: 6 frames per row; Idle: 8 frames per row; each frame is 460x460.
-    this.load.spritesheet(
-      "phishville_character_walk",
-      "/assets/characters/Character0/Character0_Walk.png",
-      { frameWidth: CHARACTER_FRAME_SIZE, frameHeight: CHARACTER_FRAME_SIZE }
-    );
-    this.load.spritesheet(
-      "phishville_character_idle",
-      "/assets/characters/Character0/Character0_Idle.png",
-      { frameWidth: CHARACTER_FRAME_SIZE, frameHeight: CHARACTER_FRAME_SIZE }
-    );
+    if (!this.textures.exists("phishville_character_walk")) {
+      this.load.spritesheet(
+        "phishville_character_walk",
+        "/assets/characters/Character0/Character0_Walk.png",
+        { frameWidth: CHARACTER_FRAME_SIZE, frameHeight: CHARACTER_FRAME_SIZE }
+      );
+    }
+    if (!this.textures.exists("phishville_character_idle")) {
+      this.load.spritesheet(
+        "phishville_character_idle",
+        "/assets/characters/Character0/Character0_Idle.png",
+        { frameWidth: CHARACTER_FRAME_SIZE, frameHeight: CHARACTER_FRAME_SIZE }
+      );
+    }
   }
 
   async create() {
-    this.cameras.main.setBackgroundColor("#b9d9eb");
-    this.add.text(18, 14, "PHISHVILLE", {
+    this.isStudyMode = this.isStudyMode || this.registry.get("phishvilleMode") === "study";
+    this.studyLessonId = this.studyLessonId || this.registry.get("studyCurrentLessonId") || null;
+    this.studyStepIndex = this.registry.get("studyMissionStep") ?? this.studyStepIndex;
+    this.cameras.main.setBackgroundColor("#b8d8e7");
+    this.cityTitleText = this.add.text(18, 14, "PHISHVILLE", {
       fontFamily: "Arial, sans-serif",
       fontSize: "22px",
       fontStyle: "bold",
@@ -110,6 +160,7 @@ export default class CityScene extends Phaser.Scene {
       this.load.once("complete", () => {
         this.renderCity();
         this.setupCameraAndControls();
+        if (this.isStudyMode) this.setupStudyMode();
       });
       this.load.on("loaderror", (file) => {
         console.error("PhishVille could not load city asset:", file?.src || file?.key);
@@ -201,30 +252,18 @@ export default class CityScene extends Phaser.Scene {
 
     this.createSkyBackdrop();
 
-    // First draw a padded grass border. Its opacity fades smoothly toward zero,
-    // so the square map boundary blends into the sky instead of ending abruptly.
+    // Draw a muted, continuous-looking outskirts ring. It stays fully opaque;
+    // the atmospheric fog is responsible for concealing the world boundary.
     for (let y = -EDGE_PADDING_TILES; y < rows + EDGE_PADDING_TILES; y++) {
       for (let x = -EDGE_PADDING_TILES; x < cols + EDGE_PADDING_TILES; x++) {
         const isInsideMap = x >= 0 && x < cols && y >= 0 && y < rows;
-        if (isInsideMap) continue;
-
-        const outsideX = x < 0 ? -x : x >= cols ? x - cols + 1 : 0;
-        const outsideY = y < 0 ? -y : y >= rows ? y - rows + 1 : 0;
-        const distance = Math.max(outsideX, outsideY);
-        const fadeProgress = Phaser.Math.Clamp(
-          1 - distance / (EDGE_PADDING_TILES + 1),
-          0,
-          1
-        );
-        const smoothFade = fadeProgress * fadeProgress * (3 - 2 * fadeProgress);
-        const alpha = EDGE_FADE_STRENGTH * smoothFade;
-        if (alpha < 0.025 || !this.textures.exists("city_grass")) continue;
+        if (isInsideMap || !this.textures.exists("city_grass")) continue;
 
         const position = this.gridToWorld(x, y);
         this.add.image(position.x, position.y, "city_grass")
           .setOrigin(0.5, 0)
           .setScale(1.02)
-          .setAlpha(alpha)
+          .setTint(OUTSKIRT_TINT)
           .setDepth(this.depthFromSortPoint(position.x, position.y));
       }
     }
@@ -243,6 +282,7 @@ export default class CityScene extends Phaser.Scene {
         this.add.image(position.x, position.y, textureKey)
           .setOrigin(0.5, 0)
           .setScale(textureKey.startsWith("city_snow_") ? 0.51 : 1.02)
+          .setTint(GROUND_LIGHT_TINT)
           .setDepth(this.depthFromSortPoint(position.x, position.y));
       }
     }
@@ -256,8 +296,160 @@ export default class CityScene extends Phaser.Scene {
       }
     }
 
+    this.createSoftLighting();
+    this.createPerimeterFog(cols, rows);
     this.createCharacterAnimations();
     this.spawnPlayer();
+  }
+
+  createSoftLighting() {
+    const textureKey = "phishville_soft_sunlight";
+    if (!this.textures.exists(textureKey)) {
+      const texture = this.textures.createCanvas(textureKey, 512, 512);
+      const context = texture.getContext();
+      const gradient = context.createRadialGradient(256, 256, 18, 256, 256, 256);
+      gradient.addColorStop(0, "rgba(255, 220, 158, 0.30)");
+      gradient.addColorStop(0.38, "rgba(255, 226, 177, 0.17)");
+      gradient.addColorStop(0.72, "rgba(255, 232, 196, 0.055)");
+      gradient.addColorStop(1, "rgba(255, 238, 214, 0)");
+      context.fillStyle = gradient;
+      context.fillRect(0, 0, 512, 512);
+      texture.refresh();
+    }
+
+    // Warm sunlight pools sit just above the ground layer and below buildings
+    // and the player, so they brighten the environment without washing out art.
+    const lightSpots = [
+      { x: 9, y: 13, size: 590, alpha: 0.74 },
+      { x: 33, y: 30, size: 650, alpha: 0.60 },
+      { x: 23, y: 43, size: 520, alpha: 0.46 },
+    ];
+
+    for (const spot of lightSpots) {
+      const position = this.gridToWorld(spot.x, spot.y);
+      const light = this.add.image(position.x, position.y, textureKey)
+        .setOrigin(0.5)
+        .setDisplaySize(spot.size, spot.size)
+        .setAlpha(spot.alpha)
+        .setDepth(this.depthFromSortPoint(position.x, position.y, 0.025));
+      this.sunlightLayers.push(light);
+    }
+
+    // A very light warm ambient wash unifies the city palette.
+    const ambient = this.add.rectangle(
+      this.worldWidth / 2,
+      this.worldHeight / 2,
+      this.worldWidth,
+      this.worldHeight,
+      0xffe8c8,
+      0.035
+    );
+    ambient.setDepth(30000000);
+    this.sunlightLayers.push(ambient);
+  }
+
+  createPerimeterFog(cols, rows) {
+    const textureKey = "phishville_perimeter_fog";
+    if (!this.textures.exists(textureKey)) {
+      const texture = this.textures.createCanvas(textureKey, 512, 512);
+      const context = texture.getContext();
+
+      // Fog is densest at the outer boundary and thins gently into the city.
+      const gradient = context.createLinearGradient(0, 0, 0, 512);
+      gradient.addColorStop(0, "rgba(207, 224, 216, 0.88)");
+      gradient.addColorStop(0.12, "rgba(207, 224, 216, 0.72)");
+      gradient.addColorStop(0.34, "rgba(211, 227, 220, 0.40)");
+      gradient.addColorStop(0.62, "rgba(216, 230, 224, 0.15)");
+      gradient.addColorStop(1, "rgba(216, 230, 224, 0)");
+      context.fillStyle = gradient;
+      context.fillRect(0, 0, 512, 512);
+
+      // Uneven soft puffs break up the straight edge, giving the fog a natural shape.
+      const puffs = [
+        [42, 76, 68, 0.30], [118, 138, 86, 0.26], [205, 62, 76, 0.24],
+        [292, 154, 92, 0.28], [394, 88, 72, 0.24], [475, 178, 76, 0.20],
+        [72, 250, 68, 0.13], [346, 278, 82, 0.12],
+      ];
+      for (const [x, y, radius, alpha] of puffs) {
+        const puff = context.createRadialGradient(x, y, 2, x, y, radius);
+        puff.addColorStop(0, `rgba(229, 239, 232, ${alpha})`);
+        puff.addColorStop(1, "rgba(229, 239, 232, 0)");
+        context.fillStyle = puff;
+        context.fillRect(x - radius, y - radius, radius * 2, radius * 2);
+      }
+      texture.refresh();
+    }
+
+    const min = -EDGE_PADDING_TILES;
+    const maxX = cols + EDGE_PADDING_TILES - 1;
+    const maxY = rows + EDGE_PADDING_TILES - 1;
+    const corners = [
+      this.gridToWorld(min, min),
+      this.gridToWorld(maxX, min),
+      this.gridToWorld(maxX, maxY),
+      this.gridToWorld(min, maxY),
+    ];
+    const center = this.gridToWorld((min + maxX) / 2, (min + maxY) / 2);
+
+    for (let i = 0; i < corners.length; i++) {
+      const start = corners[i];
+      const end = corners[(i + 1) % corners.length];
+      const dx = end.x - start.x;
+      const dy = end.y - start.y;
+      const length = Math.hypot(dx, dy);
+      const angle = Math.atan2(dy, dx);
+      const midpoint = { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 };
+
+      // The ordered corners run around the diamond; local +Y points inward.
+      // Shift the strip half a tile outward so it covers the outer tile corners.
+      let inwardX = -dy / length;
+      let inwardY = dx / length;
+      const towardCenterX = center.x - midpoint.x;
+      const towardCenterY = center.y - midpoint.y;
+      if (inwardX * towardCenterX + inwardY * towardCenterY < 0) {
+        inwardX *= -1;
+        inwardY *= -1;
+      }
+
+      const tileEdgeProjection = Math.abs(inwardX) * HALF_TILE_WIDTH +
+        Math.abs(inwardY) * (TILE_HEIGHT / 2);
+      const edgePosition = {
+        x: midpoint.x - inwardX * tileEdgeProjection,
+        y: midpoint.y - inwardY * tileEdgeProjection,
+      };
+
+      // If corner order ever changes, rotate to keep the fog's vertical axis inward.
+      const fogRotation = Math.atan2(-inwardX, inwardY);
+      const fog = this.add.image(edgePosition.x, edgePosition.y, textureKey)
+        .setOrigin(0.5, 0)
+        .setRotation(fogRotation)
+        .setDisplaySize(length + 100, PERIMETER_FOG_DEPTH)
+        .setAlpha(PERIMETER_FOG_ALPHA)
+        .setDepth(50000000 + i);
+      this.perimeterFog.push(fog);
+    }
+
+    // Round fog puffs soften the four sharp diamond tips.
+    const puffKey = "phishville_fog_corner_puff";
+    if (!this.textures.exists(puffKey)) {
+      const puffTexture = this.textures.createCanvas(puffKey, 256, 256);
+      const puffContext = puffTexture.getContext();
+      const puffGradient = puffContext.createRadialGradient(128, 128, 8, 128, 128, 128);
+      puffGradient.addColorStop(0, "rgba(215, 230, 221, 0.76)");
+      puffGradient.addColorStop(0.42, "rgba(215, 230, 221, 0.40)");
+      puffGradient.addColorStop(0.78, "rgba(215, 230, 221, 0.12)");
+      puffGradient.addColorStop(1, "rgba(215, 230, 221, 0)");
+      puffContext.fillStyle = puffGradient;
+      puffContext.fillRect(0, 0, 256, 256);
+      puffTexture.refresh();
+    }
+    for (const point of corners) {
+      const puff = this.add.image(point.x, point.y, puffKey)
+        .setDisplaySize(360, 360)
+        .setAlpha(0.74)
+        .setDepth(50000010);
+      this.perimeterFog.push(puff);
+    }
   }
 
   createSkyBackdrop() {
@@ -266,10 +458,10 @@ export default class CityScene extends Phaser.Scene {
       const texture = this.textures.createCanvas(textureKey, 512, 512);
       const context = texture.getContext();
       const gradient = context.createLinearGradient(0, 0, 0, 512);
-      gradient.addColorStop(0, "#91c4e6");
-      gradient.addColorStop(0.46, "#c7e2e9");
-      gradient.addColorStop(0.78, "#e8eddf");
-      gradient.addColorStop(1, "#f3e5c8");
+      gradient.addColorStop(0, "#82b9df");
+      gradient.addColorStop(0.42, "#b8d7e5");
+      gradient.addColorStop(0.74, "#dce5db");
+      gradient.addColorStop(1, "#f0dfc6");
       context.fillStyle = gradient;
       context.fillRect(0, 0, 512, 512);
       texture.refresh();
@@ -280,6 +472,25 @@ export default class CityScene extends Phaser.Scene {
       .setScrollFactor(0)
       .setDepth(-2000000000);
     this.resizeSkyBackdrop(this.scale.width, this.scale.height);
+
+    // Gentle sun bloom in the upper sky, kept soft so it does not compete with play.
+    const sunKey = "phishville_sky_sun_bloom";
+    if (!this.textures.exists(sunKey)) {
+      const sunTexture = this.textures.createCanvas(sunKey, 256, 256);
+      const sunContext = sunTexture.getContext();
+      const sunGradient = sunContext.createRadialGradient(128, 128, 4, 128, 128, 128);
+      sunGradient.addColorStop(0, "rgba(255, 246, 218, 0.48)");
+      sunGradient.addColorStop(0.28, "rgba(255, 235, 190, 0.24)");
+      sunGradient.addColorStop(0.68, "rgba(255, 230, 190, 0.07)");
+      sunGradient.addColorStop(1, "rgba(255, 230, 190, 0)");
+      sunContext.fillStyle = sunGradient;
+      sunContext.fillRect(0, 0, 256, 256);
+      sunTexture.refresh();
+    }
+    this.add.image(this.scale.width * 0.78, this.scale.height * 0.16, sunKey)
+      .setDisplaySize(360, 360)
+      .setScrollFactor(0)
+      .setDepth(-1999999999);
 
     // Soft clouds live behind the isometric world. They are visible only where
     // the faded outskirts reveal the sky, so they never cover streets/buildings.
@@ -459,10 +670,12 @@ export default class CityScene extends Phaser.Scene {
   }
 
   createCharacterAnimations() {
-    if (!this.anims.exists("character_idle_0")) {
-      for (let row = 0; row < 5; row++) {
+    for (let row = 0; row < 5; row++) {
+      const idleKey = `character_idle_${row}`;
+      const walkKey = `character_walk_${row}`;
+      if (!this.anims.exists(idleKey)) {
         this.anims.create({
-          key: `character_idle_${row}`,
+          key: idleKey,
           frames: this.anims.generateFrameNumbers("phishville_character_idle", {
             start: row * 8,
             end: row * 8 + 7,
@@ -470,8 +683,10 @@ export default class CityScene extends Phaser.Scene {
           frameRate: 5,
           repeat: -1,
         });
+      }
+      if (!this.anims.exists(walkKey)) {
         this.anims.create({
-          key: `character_walk_${row}`,
+          key: walkKey,
           frames: this.anims.generateFrameNumbers("phishville_character_walk", {
             start: row * 6,
             end: row * 6 + 5,
@@ -512,7 +727,9 @@ export default class CityScene extends Phaser.Scene {
       return;
     }
 
-    const spawn = this.findSpawnTile(2, 3);
+    // Study Mode begins outside the Cyber Academy; Story Mode keeps its
+    // original residential-area spawn.
+    const spawn = this.isStudyMode ? { x: 20, y: 35 } : this.findSpawnTile(2, 3);
     if (!spawn) {
       console.error("No walkable tile was found for the player spawn.");
       return;
@@ -615,8 +832,14 @@ export default class CityScene extends Phaser.Scene {
     this.player.setDepth(this.depthFromSortPoint(this.player.x, this.player.y, 0.2));
   }
 
-  update(_time, delta) {
+  update(time, delta) {
     this.updatePlayer(delta);
+    if (this.isStudyMode) {
+      if (this.studyInteractKey && Phaser.Input.Keyboard.JustDown(this.studyInteractKey)) {
+        this.handleStudyInteract();
+      }
+      this.updateStudyMode(time);
+    }
   }
 
   getCell(gridX, gridY) {
@@ -627,4 +850,301 @@ export default class CityScene extends Phaser.Scene {
     const cell = this.getCell(gridX, gridY);
     return Boolean(cell && cell.type !== "building");
   }
+
+  // --------------------------- STUDY MODE ---------------------------
+
+  setupStudyMode() {
+    this.studyLesson = STUDY_LESSONS.find((lesson) => lesson.id === this.studyLessonId);
+    if (!this.studyLesson) {
+      console.error("Study Mode lesson not found:", this.studyLessonId);
+      return;
+    }
+
+    // Replace compact Story Mode overlays with the Study Mode city HUD.
+    this.controlHint?.destroy();
+    this.cityTitleText?.destroy();
+    this.studyInteractKey = this.input.keyboard?.addKey(Phaser.Input.Keyboard.KeyCodes.E);
+
+    this.createStudyLandmarkLabels();
+    this.createStudyNpcs();
+    this.createStudyHud();
+    this.createStudyDialogue();
+    this.createStudyWaypoint();
+  }
+
+  createCityCard(x, y, width, height, headerText) {
+    const graphics = this.add.graphics();
+    graphics.fillStyle(0xf8f1df, 0.97);
+    graphics.lineStyle(2, 0x355940, 1);
+    graphics.fillRoundedRect(x, y, width, height, 10);
+    graphics.strokeRoundedRect(x, y, width, height, 10);
+    graphics.fillStyle(0x355940, 1);
+    graphics.fillRoundedRect(x, y, width, 28, 8);
+    graphics.fillRect(x, y + 18, width, 10);
+    graphics.setScrollFactor(0).setDepth(1000000000);
+    this.add.text(x + 12, y + 6, headerText, {
+      fontFamily: "Arial, sans-serif",
+      fontSize: "12px",
+      fontStyle: "bold",
+      color: "#fff4d9",
+      letterSpacing: 1,
+    }).setScrollFactor(0).setDepth(1000000001);
+    return graphics;
+  }
+
+  createStudyHud() {
+    this.createCityCard(16, 16, 300, 82, "CONTROLS  /  FIELD GUIDE");
+    this.add.text(30, 53, "[ W A S D ]  or  [ ARROWS ]   MOVE\n[ E ]   TALK  /  INTERACT", {
+      fontFamily: "Arial, sans-serif",
+      fontSize: "12px",
+      fontStyle: "bold",
+      color: "#2d4735",
+      lineSpacing: 5,
+    }).setScrollFactor(0).setDepth(1000000001);
+
+    this.createCityCard(16, 108, 320, 226, `STUDY TASK  ${this.studyLesson.number} / 02`);
+    this.add.text(30, 145, this.studyLesson.title, {
+      fontFamily: "Arial, sans-serif",
+      fontSize: "15px",
+      fontStyle: "bold",
+      color: "#294a36",
+      wordWrap: { width: 288 },
+    }).setScrollFactor(0).setDepth(1000000001);
+
+    this.studyProgressText = this.add.text(30, 180, "STEP 1 OF 3", {
+      fontFamily: "Arial, sans-serif",
+      fontSize: "11px",
+      fontStyle: "bold",
+      color: "#a66c25",
+    }).setScrollFactor(0).setDepth(1000000001);
+
+    this.studyHudText = this.add.text(30, 200, "", {
+      fontFamily: "Arial, sans-serif",
+      fontSize: "12px",
+      color: "#3b4c3d",
+      lineSpacing: 8,
+      wordWrap: { width: 286 },
+    }).setScrollFactor(0).setDepth(1000000001);
+    this.refreshStudyHud();
+
+    this.studyInteractPrompt = this.add.text(this.scale.width / 2, this.scale.height - 28, "", {
+      fontFamily: "Arial, sans-serif",
+      fontSize: "14px",
+      fontStyle: "bold",
+      color: "#fff6df",
+      backgroundColor: "#294b38",
+      padding: { x: 12, y: 7 },
+    }).setOrigin(0.5, 1).setScrollFactor(0).setDepth(1000000002).setVisible(false);
+
+    this.scale.on("resize", (size) => {
+      this.studyInteractPrompt?.setPosition(size.width / 2, size.height - 28);
+      if (this.studyDialoguePanel) {
+        this.studyDialoguePanel.setPosition(350, size.height - 164);
+      }
+    });
+  }
+
+  refreshStudyHud() {
+    if (!this.studyLesson || !this.studyHudText || !this.studyProgressText) return;
+    const lines = this.studyLesson.steps.map((step, index) => {
+      const marker = index < this.studyStepIndex ? "✓" : index === this.studyStepIndex ? "◆" : "○";
+      const prefix = index === this.studyStepIndex ? "NOW  " : "      ";
+      return `${marker} ${prefix}${step.title}`;
+    });
+    this.studyProgressText.setText(
+      this.studyStepIndex >= this.studyLesson.steps.length
+        ? "TASK COMPLETE"
+        : `STEP ${this.studyStepIndex + 1} OF ${this.studyLesson.steps.length}`
+    );
+    this.studyHudText.setText(lines.join("\n\n"));
+  }
+
+  createStudyLandmarkLabels() {
+    for (const landmark of this.studyLesson.landmarks) {
+      const point = this.gridToWorld(landmark.tile.x, landmark.tile.y);
+      this.add.text(point.x, point.y - 26, landmark.name, {
+        fontFamily: "Arial, sans-serif",
+        fontSize: "11px",
+        fontStyle: "bold",
+        color: "#fff6dc",
+        backgroundColor: "#294b38",
+        padding: { x: 7, y: 4 },
+        stroke: "#1b3325",
+        strokeThickness: 2,
+      }).setOrigin(0.5, 1).setDepth(this.depthFromSortPoint(point.x, point.y, 0.28)).setY(point.y - 52);
+    }
+  }
+
+  createStudyNpcs() {
+    if (!this.textures.exists("phishville_character_idle")) return;
+
+    for (let index = 0; index < this.studyLesson.steps.length; index++) {
+      const step = this.studyLesson.steps[index];
+      const point = this.gridToWorld(step.tile.x, step.tile.y);
+      this.add.ellipse(point.x, point.y + 7, 26, 9, 0x28362b, 0.22)
+        .setDepth(this.depthFromSortPoint(point.x, point.y, 0.1));
+      const sprite = this.add.sprite(point.x, point.y + 7, "phishville_character_idle", 0)
+        .setOrigin(0.5, 0.93)
+        .setScale(CHARACTER_SCALE)
+        .setTint(step.tint || 0xffffff)
+        .setDepth(this.depthFromSortPoint(point.x, point.y + 7, 0.22));
+      sprite.play(`character_idle_${index % 5}`);
+
+      this.add.text(point.x, point.y - 34, `${step.npcName}  •  ${step.role}`, {
+        fontFamily: "Arial, sans-serif",
+        fontSize: "11px",
+        fontStyle: "bold",
+        color: "#263f30",
+        backgroundColor: "#fff4dc",
+        padding: { x: 6, y: 4 },
+        stroke: "#ffffff",
+        strokeThickness: 1,
+      }).setOrigin(0.5, 1).setDepth(this.depthFromSortPoint(point.x, point.y, 0.25));
+
+      this.studyNpcs.push({
+        stepIndex: index,
+        sprite,
+        x: point.x,
+        y: point.y + 7,
+        name: step.npcName,
+        role: step.role,
+        step,
+      });
+    }
+  }
+
+  createStudyWaypoint() {
+    this.studyWaypoint?.forEach((item) => item.destroy());
+    this.studyWaypoint = null;
+    const step = this.studyLesson.steps[this.studyStepIndex];
+    if (!step) return;
+
+    const point = this.gridToWorld(step.tile.x, step.tile.y);
+    const baseY = point.y + 4;
+    const depth = this.depthFromSortPoint(point.x, baseY, 0.24);
+    const beam = this.add.rectangle(point.x, baseY - 38, 4, 68, 0xffd56c, 0.34).setDepth(depth - 1);
+    const orb = this.add.circle(point.x, baseY - 76, 10, 0xffd56c, 0.98)
+      .setStrokeStyle(3, 0xfff1bd, 1).setDepth(depth + 2);
+    const core = this.add.circle(point.x, baseY - 76, 4, 0xffffff, 1).setDepth(depth + 3);
+    const ring = this.add.ellipse(point.x, baseY + 3, 38, 15, 0xffd56c, 0.16)
+      .setStrokeStyle(2, 0xffd56c, 0.9).setDepth(depth + 1);
+    this.studyWaypoint = { beam, orb, core, ring, baseY };
+  }
+
+  createStudyDialogue() {
+    const x = 350;
+    const y = this.scale.height - 164;
+    const width = Math.max(420, this.scale.width - 370);
+    const height = 142;
+    const panel = this.add.graphics();
+    panel.fillStyle(0xf8f1df, 0.98).lineStyle(3, 0x355940, 1);
+    panel.fillRoundedRect(x, y, width, height, 12);
+    panel.strokeRoundedRect(x, y, width, height, 12);
+    panel.fillStyle(0x355940, 1).fillRoundedRect(x, y, width, 30, 9);
+    panel.fillRect(x, y + 20, width, 10);
+    panel.setScrollFactor(0).setDepth(1000000003).setVisible(false);
+
+    this.studyDialoguePanel = panel;
+    this.studyDialogueName = this.add.text(x + 14, y + 7, "", {
+      fontFamily: "Arial, sans-serif", fontSize: "12px", fontStyle: "bold", color: "#fff4dc",
+    }).setScrollFactor(0).setDepth(1000000004).setVisible(false);
+    this.studyDialogueText = this.add.text(x + 18, y + 43, "", {
+      fontFamily: "Arial, sans-serif", fontSize: "14px", color: "#334738",
+      lineSpacing: 5, wordWrap: { width: width - 36 },
+    }).setScrollFactor(0).setDepth(1000000004).setVisible(false);
+    this.studyDialogueHint = this.add.text(x + width - 14, y + height - 24, "[ E ] CONTINUE", {
+      fontFamily: "Arial, sans-serif", fontSize: "11px", fontStyle: "bold", color: "#9b6b2c",
+    }).setOrigin(1, 0.5).setScrollFactor(0).setDepth(1000000004).setVisible(false);
+  }
+
+  showStudyDialogue(name, text, hint = "[ E ] CONTINUE") {
+    if (!this.studyDialoguePanel) this.createStudyDialogue();
+    this.studyDialoguePanel.setVisible(true);
+    this.studyDialogueName.setVisible(true).setText(name);
+    this.studyDialogueText.setVisible(true).setText(text);
+    this.studyDialogueHint.setVisible(true).setText(hint);
+    this.studyDialogueOpen = true;
+    this.studyInteractPrompt?.setVisible(false);
+  }
+
+  hideStudyDialogue() {
+    this.studyDialoguePanel?.setVisible(false);
+    this.studyDialogueName?.setVisible(false);
+    this.studyDialogueText?.setVisible(false);
+    this.studyDialogueHint?.setVisible(false);
+    this.studyDialogueOpen = false;
+  }
+
+  getActiveStudyNpc() {
+    return this.studyNpcs.find((npc) => npc.stepIndex === this.studyStepIndex) || null;
+  }
+
+  updateStudyMode(time) {
+    if (this.studyWaypoint) {
+      const bob = Math.sin(time / 220) * 8;
+      const { beam, orb, core, ring, baseY } = this.studyWaypoint;
+      beam.setY(baseY - 38 + bob * 0.35);
+      orb.setY(baseY - 76 + bob);
+      core.setY(baseY - 76 + bob);
+      ring.setScale(1 + Math.sin(time / 260) * 0.12);
+      ring.setAlpha(0.62 + Math.sin(time / 260) * 0.22);
+    }
+
+    if (this.studyDialogueOpen || !this.player) return;
+    const npc = this.getActiveStudyNpc();
+    if (!npc) return;
+    const distance = Phaser.Math.Distance.Between(this.player.x, this.player.y, npc.x, npc.y);
+    const close = distance < 66;
+    this.studyInteractPrompt?.setVisible(close).setText(close ? `[ E ] TALK TO ${npc.name.toUpperCase()}` : "");
+  }
+
+  handleStudyInteract() {
+    if (!this.isStudyMode || !this.studyLesson) return;
+
+    if (this.studyDialogueOpen) {
+      this.continueStudyDialogue();
+      return;
+    }
+
+    const npc = this.getActiveStudyNpc();
+    if (!npc || !this.player) return;
+    const distance = Phaser.Math.Distance.Between(this.player.x, this.player.y, npc.x, npc.y);
+    if (distance > 66) return;
+
+    const step = npc.step;
+    this.showStudyDialogue(`${step.npcName}  •  ${step.role}`, `${step.dialogue}\n\n${step.response}`);
+  }
+
+  continueStudyDialogue() {
+    if (this.studyPendingReturn) {
+      this.scene.start("ClassroomScene", { completedConcept: this.studyLesson.id });
+      return;
+    }
+
+    this.hideStudyDialogue();
+    this.studyStepIndex += 1;
+    this.registry.set("studyMissionStep", this.studyStepIndex);
+
+    if (this.studyStepIndex >= this.studyLesson.steps.length) {
+      const completed = this.registry.get("studyCompletedConcepts") || [];
+      if (!completed.includes(this.studyLesson.id)) {
+        this.registry.set("studyCompletedConcepts", [...completed, this.studyLesson.id]);
+      }
+      this.studyPendingReturn = true;
+      this.studyWaypoint?.forEach((item) => item.destroy());
+      this.studyWaypoint = null;
+      this.studyInteractPrompt?.setVisible(false);
+      this.refreshStudyHud();
+      this.showStudyDialogue(
+        "FIELD TASK COMPLETE  •  WELL DONE!",
+        "You completed the city task and used the safety checks from your classroom lesson. Return to the Cyber Academy to unlock the next concept.",
+        "[ E ] RETURN TO CLASSROOM"
+      );
+      return;
+    }
+
+    this.refreshStudyHud();
+    this.createStudyWaypoint();
+  }
+
 }
